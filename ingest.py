@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import paho.mqtt.client as mqtt
@@ -15,20 +16,20 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"GeoX Ingest Service is active and monitoring.")
+        self.wfile.write(b"GeoX Ingest Service is Active")
 
     def log_message(self, format, *args):
-        # Silence HTTP access logs in Render console
         return
 
 def start_dummy_http_server():
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    print(f"--> [Render HTTP] Binding dummy web server to port {port}")
+    print(f"--> [Render HTTP] Server listening on port {port}")
     server.serve_forever()
 
-# Launch HTTP server on a separate background thread
-threading.Thread(target=start_dummy_http_server, daemon=True).start()
+# Start dummy HTTP server immediately in background
+http_thread = threading.Thread(target=start_dummy_http_server, daemon=True)
+http_thread.start()
 
 
 # ==========================================
@@ -41,14 +42,13 @@ MQTT_USER = os.environ.get("MQTT_USER")
 MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD")
 TOPIC = "geox/aizawl/node1/telemetry"
 
-# Load Pre-trained Machine Learning Model
 MODEL_PATH = "landslide_model.joblib"
 model = None
 if os.path.exists(MODEL_PATH):
     model = joblib.load(MODEL_PATH)
     print("--> ML Model loaded successfully.")
 else:
-    print(f"--> WARNING: {MODEL_PATH} not found. Defaulting risk calculations.")
+    print(f"--> WARNING: {MODEL_PATH} not found.")
 
 
 # ==========================================
@@ -83,12 +83,11 @@ init_db()
 
 
 # ==========================================
-# 3. MQTT CALLBACKS & RISK LOGIC
+# 3. MQTT LOGIC & PREDICTIONS
 # ==========================================
 def calculate_risk(rainfall, soil_0_10, soil_10_40, soil_40_100, slope):
     if model:
         try:
-            # Structuring input with explicit feature names prevents scikit-learn warnings
             features = pd.DataFrame([{
                 'rainfall_mm': rainfall,
                 'soil_moisture_0_10cm': soil_0_10,
@@ -119,7 +118,7 @@ def on_connect(client, userdata, flags, rc):
         client.subscribe(TOPIC)
         print(f"--> Subscribed to topic: {TOPIC}")
     else:
-        print(f"--> Connection failed with status code {rc}")
+        print(f"--> Connection failed with code {rc}")
 
 
 def on_message(client, userdata, msg):
@@ -136,7 +135,6 @@ def on_message(client, userdata, msg):
 
         prob, risk_level = calculate_risk(rainfall, soil_0_10, soil_10_40, soil_40_100, slope)
 
-        # Write to Neon Database
         conn = psycopg2.connect(dsn=DATABASE_URL)
         cur = conn.cursor()
         cur.execute("""
@@ -147,20 +145,18 @@ def on_message(client, userdata, msg):
         conn.commit()
         cur.close()
         conn.close()
-        print(f"--> Record Saved to Database: Node {node_id} | Risk: {risk_level} ({prob*100:.1f}%)")
+        print(f"--> Record Saved: Node {node_id} | Risk: {risk_level} ({prob*100:.1f}%)")
 
-        # Trigger physical buzzer relay if CRITICAL
         if risk_level == "CRITICAL":
             alert_topic = f"geox/aizawl/{node_id}/control"
             client.publish(alert_topic, json.dumps({"relay": "ON", "alarm": "CRITICAL_LANDSLIDE"}))
-            print(f"--> 🚨 CRITICAL ALARM PUBLISHED to {alert_topic}")
 
     except Exception as e:
         print(f"--> Error processing message: {e}")
 
 
 # ==========================================
-# 4. MAIN LOOP
+# 4. MAIN LOOP (Non-blocking)
 # ==========================================
 if __name__ == "__main__":
     client = mqtt.Client(client_id="GeoX_Cloud_Worker", protocol=mqtt.MQTTv311)
@@ -172,4 +168,10 @@ if __name__ == "__main__":
 
     print("--> Connecting to HiveMQ...")
     client.connect(MQTT_BROKER, MQTT_PORT, 60)
-    client.loop_forever()
+    
+    # Use non-blocking background loop
+    client.loop_start()
+
+    # Keep script alive permanently
+    while True:
+        time.sleep(1)
