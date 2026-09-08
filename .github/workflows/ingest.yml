@@ -1,0 +1,93 @@
+name: 24/7 Telemetry Ingest Worker
+
+on:
+  schedule:
+    # Runs automatically every 5 minutes to process queued telemetry
+    - cron: '*/5 * * * *'
+  workflow_dispatch: # Allows manual trigger from GitHub UI
+
+jobs:
+  run-ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Execute Ingest Pipeline
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          MQTT_BROKER: ${{ secrets.MQTT_BROKER }}
+          MQTT_PORT: ${{ secrets.MQTT_PORT }}
+          MQTT_USER: ${{ secrets.MQTT_USER }}
+          MQTT_PASSWORD: ${{ secrets.MQTT_PASSWORD }}
+        run: |
+          python -c "
+          import os, json, time, psycopg2, joblib, pandas as pd
+          import paho.mqtt.client as mqtt
+
+          DATABASE_URL = os.environ.get('DATABASE_URL')
+          MQTT_BROKER = os.environ.get('MQTT_BROKER')
+          MQTT_PORT = int(os.environ.get('MQTT_PORT', 8883))
+          MQTT_USER = os.environ.get('MQTT_USER')
+          MQTT_PASSWORD = os.environ.get('MQTT_PASSWORD')
+          TOPIC = 'geox/aizawl/node1/telemetry'
+
+          print('--> Connecting to HiveMQ...')
+          
+          def on_connect(client, userdata, flags, rc):
+              print('--> Connected! Subscribing to topic...')
+              client.subscribe(TOPIC)
+
+          def on_message(client, userdata, msg):
+              try:
+                  payload = json.loads(msg.payload.decode())
+                  print(f'--> Received Payload: {payload}')
+                  
+                  conn = psycopg2.connect(dsn=DATABASE_URL)
+                  cur = conn.cursor()
+                  cur.execute('''
+                      INSERT INTO telemetry 
+                      (node_id, rainfall_mm, soil_moisture_0_10cm, soil_moisture_10_40cm, soil_moisture_40_100cm, slope_angle_deg, landslide_probability, risk_level)
+                      VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                  ''', (
+                      payload.get('node_id', 'NODE_01'),
+                      float(payload.get('rainfall_mm', 0.0)),
+                      float(payload.get('soil_moisture_0_10cm', 0.0)),
+                      float(payload.get('soil_moisture_10_40cm', 0.0)),
+                      float(payload.get('soil_moisture_40_100cm', 0.0)),
+                      float(payload.get('slope_angle_deg', 35.0)),
+                      0.15, 'NORMAL'
+                  ))
+                  conn.commit()
+                  cur.close()
+                  conn.close()
+                  print('--> Record Successfully Saved to Neon Database!')
+              except Exception as e:
+                  print(f'--> Error: {e}')
+
+          try:
+              client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION1, client_id='GeoX_GHA_Worker')
+          except:
+              client = mqtt.Client(client_id='GeoX_GHA_Worker')
+
+          client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
+          client.tls_set()
+          client.on_connect = on_connect
+          client.on_message = on_message
+          client.connect(MQTT_BROKER, MQTT_PORT, 60)
+          
+          # Listen for incoming messages for 4 minutes
+          client.loop_start()
+          time.sleep(240)
+          client.loop_stop()
+          "
