@@ -83,14 +83,19 @@ init_db()
 
 
 # ==========================================
-# 3. MQTT CALL BACKS & RISK LOGIC
+# 3. MQTT CALLBACKS & RISK LOGIC
 # ==========================================
 def calculate_risk(rainfall, soil_0_10, soil_10_40, soil_40_100, slope):
     if model:
         try:
-            features = pd.DataFrame([[rainfall, soil_0_10, soil_10_40, soil_40_100, slope]],
-                                    columns=['rainfall_mm', 'soil_moisture_0_10cm', 
-                                             'soil_moisture_10_40cm', 'soil_moisture_40_100cm', 'slope_angle_deg'])
+            # Structuring input with explicit feature names prevents scikit-learn warnings
+            features = pd.DataFrame([{
+                'rainfall_mm': rainfall,
+                'soil_moisture_0_10cm': soil_0_10,
+                'soil_moisture_10_40cm': soil_10_40,
+                'soil_moisture_40_100cm': soil_40_100,
+                'slope_angle_deg': slope
+            }])
             prob = float(model.predict_proba(features)[0][1])
         except Exception as e:
             print(f"--> Prediction Error: {e}")
