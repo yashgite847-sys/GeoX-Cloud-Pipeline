@@ -1,115 +1,170 @@
 import os
 import json
-import ssl
-import joblib
-import numpy as np
-import psycopg2
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import paho.mqtt.client as mqtt
+import psycopg2
+import joblib
+import pandas as pd
 
-# Environment Variables
-BROKER   = os.getenv("MQTT_BROKER", "4cb3de54aa5e4ab78741434c63f87829.s1.eu.hivemq.cloud")
-PORT     = int(os.getenv("MQTT_PORT", 8883))
-USER     = os.getenv("MQTT_USER", "geox_node1")
-PASSWORD = os.getenv("MQTT_PASSWORD", "Geox1234!")
-DB_URL   = os.getenv("DATABASE_URL")
+# ==========================================
+# 0. DUMMY HTTP SERVER (Keeps Render Free Tier Happy)
+# ==========================================
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"GeoX Ingest Service is active and monitoring.")
 
-TOPIC_DATA  = "geox/landslide/data"
-TOPIC_ALERT = "geox/alerts/command"
-
-# Load ML Model
-try:
-    model = joblib.load("landslide_model.joblib")
-    print("[ML] Loaded Aizawl ML Model.")
-except Exception as e:
-    model = None
-    print(f"[ML WARN] Model load failed: {e}")
-
-def init_db():
-    if not DB_URL:
-        print("[DB WARN] DATABASE_URL not set.")
+    def log_message(self, format, *args):
+        # Silence HTTP access logs in Render console
         return
-    conn = psycopg2.connect(DB_URL)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS telemetry (
-            id SERIAL PRIMARY KEY,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            node_id VARCHAR(50),
-            soil_moisture REAL,
-            temp_c REAL,
-            humidity REAL,
-            vib_alert INT,
-            tilt_alert INT,
-            distance_cm REAL,
-            lat REAL,
-            lng REAL,
-            risk_score REAL,
-            status VARCHAR(20)
-        );
-    ''')
-    conn.commit()
-    conn.close()
-    print("[DB] PostgreSQL Table Verified.")
 
-def evaluate_risk(data):
-    soil = float(data.get("soil_moisture", 0))
-    temp = float(data.get("temp_c", 0))
-    hum = float(data.get("humidity", 0))
-    vib = int(data.get("vib_alert", 0))
-    tilt = int(data.get("tilt_alert", 0))
-    dist = float(data.get("distance_cm", 0))
+def start_dummy_http_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    print(f"--> [Render HTTP] Binding dummy web server to port {port}")
+    server.serve_forever()
 
+# Launch HTTP server on a separate background thread
+threading.Thread(target=start_dummy_http_server, daemon=True).start()
+
+
+# ==========================================
+# 1. CONFIGURATION & SECRETS
+# ==========================================
+DATABASE_URL = os.environ.get("DATABASE_URL")
+MQTT_BROKER = os.environ.get("MQTT_BROKER")
+MQTT_PORT = int(os.environ.get("MQTT_PORT", 8883))
+MQTT_USER = os.environ.get("MQTT_USER")
+MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD")
+TOPIC = "geox/aizawl/node1/telemetry"
+
+# Load Pre-trained Machine Learning Model
+MODEL_PATH = "landslide_model.joblib"
+model = None
+if os.path.exists(MODEL_PATH):
+    model = joblib.load(MODEL_PATH)
+    print("--> ML Model loaded successfully.")
+else:
+    print(f"--> WARNING: {MODEL_PATH} not found. Defaulting risk calculations.")
+
+
+# ==========================================
+# 2. DATABASE SETUP
+# ==========================================
+def init_db():
+    try:
+        conn = psycopg2.connect(dsn=DATABASE_URL)
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS telemetry (
+                id SERIAL PRIMARY KEY,
+                node_id VARCHAR(50),
+                rainfall_mm FLOAT,
+                soil_moisture_0_10cm FLOAT,
+                soil_moisture_10_40cm FLOAT,
+                soil_moisture_40_100cm FLOAT,
+                slope_angle_deg FLOAT,
+                landslide_probability FLOAT,
+                risk_level VARCHAR(20),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        print("--> Neon PostgreSQL Database table verified.")
+    except Exception as e:
+        print(f"--> Database Initialization Error: {e}")
+
+init_db()
+
+
+# ==========================================
+# 3. MQTT CALL BACKS & RISK LOGIC
+# ==========================================
+def calculate_risk(rainfall, soil_0_10, soil_10_40, soil_40_100, slope):
     if model:
-        features = np.array([[0, 0, 0, 0, 0, 0, soil, soil, 0, 0, 0.33, temp, 6, 180, 1]])
-        risk_prob = float(model.predict_proba(features)[0][1]) * 100.0
+        try:
+            features = pd.DataFrame([[rainfall, soil_0_10, soil_10_40, soil_40_100, slope]],
+                                    columns=['rainfall_mm', 'soil_moisture_0_10cm', 
+                                             'soil_moisture_10_40cm', 'soil_moisture_40_100cm', 'slope_angle_deg'])
+            prob = float(model.predict_proba(features)[0][1])
+        except Exception as e:
+            print(f"--> Prediction Error: {e}")
+            prob = 0.05
     else:
-        risk_prob = (soil * 0.4) + (vib * 30) + (tilt * 30)
+        prob = 0.05
 
-    status = "CRITICAL" if risk_prob >= 70.0 or tilt == 1 or vib == 1 else "NORMAL"
-    return round(risk_prob, 2), status
+    if prob > 0.70 or rainfall > 50:
+        level = "CRITICAL"
+    elif prob > 0.40 or rainfall > 25:
+        level = "WARNING"
+    else:
+        level = "NORMAL"
+
+    return prob, level
+
 
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
-        print("[MQTT] Cloud Engine Active & Connected to HiveMQ.")
-        client.subscribe(TOPIC_DATA)
+        print("--> Connected to HiveMQ Cloud MQTT Broker!")
+        client.subscribe(TOPIC)
+        print(f"--> Subscribed to topic: {TOPIC}")
+    else:
+        print(f"--> Connection failed with status code {rc}")
+
 
 def on_message(client, userdata, msg):
     try:
-        data = json.loads(msg.payload.decode('utf-8'))
-        risk_score, status = evaluate_risk(data)
+        payload = json.loads(msg.payload.decode())
+        print(f"--> Incoming Telemetry Payload: {payload}")
 
-        if status == "CRITICAL":
-            client.publish(TOPIC_ALERT, "TRIGGER_ALERT")
-            print(f"[ALERT] High Risk ({risk_score}%) -> Published TRIGGER_ALERT")
-        else:
-            client.publish(TOPIC_ALERT, "CLEAR_ALERT")
+        node_id = payload.get("node_id", "node_1")
+        rainfall = float(payload.get("rainfall_mm", 0.0))
+        soil_0_10 = float(payload.get("soil_moisture_0_10cm", 0.0))
+        soil_10_40 = float(payload.get("soil_moisture_10_40cm", 0.0))
+        soil_40_100 = float(payload.get("soil_moisture_40_100cm", 0.0))
+        slope = float(payload.get("slope_angle_deg", 35.0))
 
-        if DB_URL:
-            conn = psycopg2.connect(DB_URL)
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT INTO telemetry 
-                (node_id, soil_moisture, temp_c, humidity, vib_alert, tilt_alert, distance_cm, lat, lng, risk_score, status)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ''', (
-                data.get("node_id"), data.get("soil_moisture"), data.get("temp_c"),
-                data.get("humidity"), data.get("vib_alert"), data.get("tilt_alert"),
-                data.get("distance_cm"), data.get("lat"), data.get("lng"),
-                risk_score, status
-            ))
-            conn.commit()
-            conn.close()
-            print(f"[LOG] Node: {data.get('node_id')} | Risk: {risk_score}% | Status: {status}")
+        prob, risk_level = calculate_risk(rainfall, soil_0_10, soil_10_40, soil_40_100, slope)
+
+        # Write to Neon Database
+        conn = psycopg2.connect(dsn=DATABASE_URL)
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO telemetry 
+            (node_id, rainfall_mm, soil_moisture_0_10cm, soil_moisture_10_40cm, soil_moisture_40_100cm, slope_angle_deg, landslide_probability, risk_level)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """, (node_id, rainfall, soil_0_10, soil_10_40, soil_40_100, slope, prob, risk_level))
+        conn.commit()
+        cur.close()
+        conn.close()
+        print(f"--> Record Saved to Database: Node {node_id} | Risk: {risk_level} ({prob*100:.1f}%)")
+
+        # Trigger physical buzzer relay if CRITICAL
+        if risk_level == "CRITICAL":
+            alert_topic = f"geox/aizawl/{node_id}/control"
+            client.publish(alert_topic, json.dumps({"relay": "ON", "alarm": "CRITICAL_LANDSLIDE"}))
+            print(f"--> 🚨 CRITICAL ALARM PUBLISHED to {alert_topic}")
 
     except Exception as e:
-        print(f"[ERR] Processing error: {e}")
+        print(f"--> Error processing message: {e}")
 
+
+# ==========================================
+# 4. MAIN LOOP
+# ==========================================
 if __name__ == "__main__":
-    init_db()
     client = mqtt.Client(client_id="GeoX_Cloud_Worker", protocol=mqtt.MQTTv311)
-    client.username_pw_set(USER, PASSWORD)
-    client.tls_set(cert_reqs=ssl.CERT_REQUIRED, tls_version=ssl.PROTOCOL_TLSv1_2)
+    client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
+    client.tls_set()
+
     client.on_connect = on_connect
     client.on_message = on_message
-    client.connect(BROKER, PORT, keepalive=60)
+
+    print("--> Connecting to HiveMQ...")
+    client.connect(MQTT_BROKER, MQTT_PORT, 60)
     client.loop_forever()
