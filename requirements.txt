@@ -1,0 +1,8 @@
+paho-mqtt
+scikit-learn
+joblib
+numpy
+pandas
+psycopg2-binary
+streamlit
+plotly
