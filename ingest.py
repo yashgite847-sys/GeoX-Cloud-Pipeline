@@ -27,7 +27,6 @@ def start_dummy_http_server():
     print(f"--> [Render HTTP] Server listening on port {port}")
     server.serve_forever()
 
-# Start dummy HTTP server immediately in background
 http_thread = threading.Thread(target=start_dummy_http_server, daemon=True)
 http_thread.start()
 
@@ -156,10 +155,17 @@ def on_message(client, userdata, msg):
 
 
 # ==========================================
-# 4. MAIN LOOP (Non-blocking)
+# 4. MAIN LOOP (Paho-MQTT v2.0+ Compatible)
 # ==========================================
 if __name__ == "__main__":
-    client = mqtt.Client(client_id="GeoX_Cloud_Worker", protocol=mqtt.MQTTv311)
+    try:
+        client = mqtt.Client(
+            callback_api_version=mqtt.CallbackAPIVersion.VERSION1,
+            client_id="GeoX_Cloud_Worker"
+        )
+    except AttributeError:
+        client = mqtt.Client(client_id="GeoX_Cloud_Worker")
+
     client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
     client.tls_set()
 
@@ -169,9 +175,7 @@ if __name__ == "__main__":
     print("--> Connecting to HiveMQ...")
     client.connect(MQTT_BROKER, MQTT_PORT, 60)
     
-    # Use non-blocking background loop
     client.loop_start()
 
-    # Keep script alive permanently
     while True:
         time.sleep(1)
